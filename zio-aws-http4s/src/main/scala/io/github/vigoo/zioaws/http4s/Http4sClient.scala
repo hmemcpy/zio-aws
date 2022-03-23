@@ -2,7 +2,8 @@ package io.github.vigoo.zioaws.http4s
 
 import java.util.concurrent.CompletableFuture
 
-import cats.effect.{ExitCase, Resource}
+import cats.effect.Resource
+import cats.effect.std.Dispatcher
 import fs2._
 import fs2.interop.reactivestreams._
 import org.http4s._
@@ -21,6 +22,8 @@ import software.amazon.awssdk.http.{
 }
 import software.amazon.awssdk.utils.AttributeMap
 import zio._
+import zio.blocking.Blocking
+import zio.clock.Clock
 import zio.interop.catz._
 
 import scala.jdk.CollectionConverters._
@@ -28,7 +31,8 @@ import scala.compat.java8.FutureConverters._
 import org.typelevel.ci.CIString
 
 class Http4sClient(client: Client[Task], closeFn: () => Unit)(implicit
-    runtime: Runtime[Any]
+    runtime: Runtime[Clock with Blocking],
+    dispatcher: Dispatcher[Task]
 ) extends SdkAsyncHttpClient {
 
   import Http4sClient._
@@ -84,7 +88,8 @@ class Http4sClient(client: Client[Task], closeFn: () => Unit)(implicit
       publisher: SdkHttpContentPublisher
   ): EntityBody[Task] =
     if (method.canHaveBody) {
-      publisher.toStream
+      publisher
+        .toStream[Task](asyncRuntimeInstance)
         .map(fs2.Chunk.byteBuffer)
         .flatMap(Stream.chunk)
     } else {
@@ -121,7 +126,7 @@ class Http4sClient(client: Client[Task], closeFn: () => Unit)(implicit
           SdkHttpResponse
             .builder()
             .headers(
-              response.headers.headers.toList
+              response.headers.headers
                 .groupBy(_.name)
                 .map { case (name, values) =>
                   (name.toString, values.map(_.value).asJava)
@@ -134,20 +139,18 @@ class Http4sClient(client: Client[Task], closeFn: () => Unit)(implicit
         )
       )
       streamFinished <- Promise.make[Throwable, Unit]
-      _ <- Task(
-        handler.onStream(
-          response.body.chunks
-            .map(_.toByteBuffer)
-            .onFinalizeCase {
-              case ExitCase.Completed => streamFinished.succeed(()).unit
-              case ExitCase.Canceled  => streamFinished.succeed(()).unit
-              case ExitCase.Error(throwable) =>
-                streamFinished.fail(throwable).unit
-            }
-            .toUnicastPublisher
-        )
-      )
-      _ <- streamFinished.await
+      stream = response.body.chunks
+        .map(_.toByteBuffer)
+        .onFinalizeCase {
+          case Resource.ExitCase.Succeeded => streamFinished.succeed(()).unit
+          case Resource.ExitCase.Canceled  => streamFinished.succeed(()).unit
+          case Resource.ExitCase.Errored(throwable) =>
+            streamFinished.fail(throwable).unit
+        }
+      publisher = StreamUnicastPublisher(stream, dispatcher)
+      _ <- Task {
+        handler.onStream(publisher)
+      }.ensuring(streamFinished.await.ignore)
     } yield null.asInstanceOf[Void]
   }
 }
@@ -158,10 +161,10 @@ object Http4sClient {
   case class Http4sClientBuilder(
       customization: BlazeClientBuilder[Task] => BlazeClientBuilder[Task] =
         identity
-  )(implicit runtime: Runtime[Any])
+  )(implicit runtime: Runtime[Clock with Blocking])
       extends SdkAsyncHttpClient.Builder[Http4sClientBuilder] {
 
-    def withRuntime(runtime: Runtime[Any]): Http4sClientBuilder =
+    def withRuntime(runtime: Runtime[Clock with Blocking]): Http4sClientBuilder =
       copy()(runtime)
 
     private def createClient(): Resource[Task, Client[Task]] = {
@@ -173,14 +176,25 @@ object Http4sClient {
     override def buildWithDefaults(
         serviceDefaults: AttributeMap
     ): SdkAsyncHttpClient = {
-      val (client, closeFn) = runtime.unsafeRun(createClient().allocated)
+            val ((dispatcher, client), closeFn) =
+        runtime.unsafeRun(resources.allocated)
+      implicit val d: Dispatcher[Task] = dispatcher
       new Http4sClient(client, () => runtime.unsafeRun(closeFn))
     }
 
-    def toManaged: ZManaged[Any, Throwable, Http4sClient] = {
-      createClient().toManaged.map { client =>
+    def toManaged: ZManaged[Clock, Throwable, Http4sClient] = {
+      resources.map { case (dispatcher, client) =>
+        implicit val d: Dispatcher[Task] = dispatcher
         new Http4sClient(client, () => ())
-      }
+      }.toManagedZIO
+    }
+
+    private def resources: Resource[Task, (Dispatcher[Task], Client[Task])] = {
+      cats.effect.std
+        .Dispatcher[Task]
+        .flatMap { dispatcher =>
+          createClient().map(dispatcher -> _)
+        }
     }
   }
 
